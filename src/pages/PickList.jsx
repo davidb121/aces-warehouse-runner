@@ -21,6 +21,8 @@ export default function PickList() {
   const [marking, setMarking] = useState(new Set()) // surveyIds being marked as picked
   const [closing, setClosing] = useState(false)
   const [expandedRecent, setExpandedRecent] = useState(new Set())
+  // Flat-view item checkboxes — local only, no DB writes
+  const [flatChecked, setFlatChecked] = useState(new Set())
 
   const load = useCallback(async () => {
     if (!runnerId) return
@@ -202,7 +204,9 @@ export default function PickList() {
       {openSurveys.length > 0 && (
         <div className="bg-white border-b border-slate-200 px-4 py-2 flex items-center justify-between shrink-0">
           <span className="text-sm font-semibold text-slate-600">
-            {totalChecked} / {totalNeeded} loaded
+            {viewMode === 'flat'
+              ? `${flatChecked.size} / ${collatedItems.length} items on cart`
+              : `${totalChecked} / ${totalNeeded} loaded`}
           </span>
           <div className="flex rounded-lg border border-slate-200 overflow-hidden text-xs font-semibold">
             <button
@@ -344,59 +348,54 @@ export default function PickList() {
               </div>
             ) : (
               collatedItems.map(item => {
-                const deliveredCount = item.stands.filter(
-                  s => (checked[s.surveyId] ?? new Set()).has(s.itemId)
-                ).length
-                const allDelivered = deliveredCount === item.stands.length
+                const isChecked = flatChecked.has(item.id)
 
                 return (
                   <div
                     key={item.id}
-                    className={`mx-4 mt-4 bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm ${allDelivered ? 'opacity-50' : ''}`}
+                    className={`mx-4 mt-4 bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm transition-opacity ${isChecked ? 'opacity-50' : ''}`}
                   >
-                    {/* Item header — shows total qty and delivery progress */}
-                    <div className="px-4 py-3 flex items-center gap-3 bg-slate-50 border-b border-slate-100">
+                    {/* Single checkbox row — item name + total qty */}
+                    <label className="flex items-center px-4 py-3.5 bg-slate-50 border-b border-slate-100 gap-4 cursor-pointer select-none active:bg-slate-100">
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={e => setFlatChecked(prev => {
+                          const next = new Set(prev)
+                          e.target.checked ? next.add(item.id) : next.delete(item.id)
+                          return next
+                        })}
+                        className="w-5 h-5 rounded accent-emerald-600 shrink-0"
+                      />
                       <div className="flex-1 min-w-0">
-                        <div className={`font-bold text-slate-800 ${allDelivered ? 'line-through' : ''}`}>
+                        <span className={`font-bold text-slate-800 ${isChecked ? 'line-through' : ''}`}>
                           {item.name}
-                          <span className="text-slate-400 text-sm font-normal ml-1.5">· {item.unit}</span>
-                        </div>
-                        <div className="text-xs text-slate-400 mt-0.5">
-                          {deliveredCount} of {item.stands.length} stand{item.stands.length !== 1 ? 's' : ''} delivered
-                        </div>
+                        </span>
+                        <span className="text-slate-400 text-sm font-normal ml-1.5">· {item.unit}</span>
                       </div>
                       <span className="shrink-0 text-2xl font-bold text-emerald-700 tabular-nums">
                         ×{item.totalQty}
                       </span>
-                    </div>
+                    </label>
 
-                    {/* Per-stand rows with checkboxes */}
+                    {/* Stand breakdown — read-only reference for restocking */}
                     {item.stands
                       .sort((a, b) =>
                         (a.standNumber?.toString() ?? a.standName)
                           .localeCompare(b.standNumber?.toString() ?? b.standName)
                       )
-                      .map(stand => {
-                        const isChecked = (checked[stand.surveyId] ?? new Set()).has(stand.itemId)
-                        const label = stand.standNumber ? `#${stand.standNumber} · ${stand.standName}` : stand.standName
+                      .map((stand, i) => {
+                        const label = stand.standNumber
+                          ? `#${stand.standNumber} · ${stand.standName}`
+                          : stand.standName
                         return (
-                          <label
-                            key={`${stand.surveyId}-${stand.itemId}`}
-                            className={`flex items-center px-4 py-3 border-b border-slate-100 last:border-0 gap-3 cursor-pointer select-none active:bg-slate-50 ${isChecked ? 'opacity-40' : ''}`}
+                          <div
+                            key={i}
+                            className="flex items-center pl-12 pr-4 py-2.5 border-b border-slate-100 last:border-0"
                           >
-                            <input
-                              type="checkbox"
-                              checked={isChecked}
-                              onChange={e => handleCheck(stand.surveyId, stand.itemId, e.target.checked)}
-                              className="w-5 h-5 rounded accent-emerald-600 shrink-0"
-                            />
-                            <span className={`flex-1 text-sm font-medium text-slate-700 ${isChecked ? 'line-through' : ''}`}>
-                              {label}
-                            </span>
-                            <span className="shrink-0 text-base font-bold text-slate-600 tabular-nums">
-                              ×{stand.qty}
-                            </span>
-                          </label>
+                            <span className="flex-1 text-sm text-slate-500">{label}</span>
+                            <span className="text-sm font-semibold text-slate-500 tabular-nums">×{stand.qty}</span>
+                          </div>
                         )
                       })}
                   </div>
