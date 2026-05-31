@@ -224,6 +224,15 @@ export async function updateSurveyStatus(surveyId, status) {
   if (error) throw error
 }
 
+export async function closePickList(surveyIds) {
+  if (!surveyIds.length) return
+  const { error } = await supabase
+    .from('surveys')
+    .update({ status: 'done' })
+    .in('id', surveyIds)
+  if (error) throw error
+}
+
 // ── Requests (in-game queue) ───────────────────────────────────────────────
 
 export async function getOpenRequests() {

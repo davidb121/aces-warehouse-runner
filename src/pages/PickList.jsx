@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useSession } from '../hooks/useSession'
 import { useToast } from '../hooks/useToast'
-import { getSurveysForRunner, updateSurveyStatus } from '../lib/db'
+import { getSurveysForRunner, updateSurveyStatus, closePickList } from '../lib/db'
 import Toast from '../components/Toast'
 
 export default function PickList() {
@@ -11,27 +11,38 @@ export default function PickList() {
   const { runnerId, runnerName } = session
   const { toast, showToast } = useToast()
 
+  // 'open' + 'picked' = active pick list; 'done' = historical
   const [openSurveys, setOpenSurveys] = useState([])
   const [doneSurveys, setDoneSurveys] = useState([])
-  const [checked, setChecked] = useState({})   // { [surveyId]: Set<itemId> }
+  const [checked, setChecked] = useState({})        // { [surveyId]: Set<itemId> }
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [viewMode, setViewMode] = useState('grouped') // 'grouped' | 'flat'
-  const [showDone, setShowDone] = useState(false)
-  const [marking, setMarking] = useState(new Set()) // surveyIds being marked
+  const [viewMode, setViewMode] = useState('grouped')
+  const [marking, setMarking] = useState(new Set()) // surveyIds being marked as picked
+  const [closing, setClosing] = useState(false)
+  const [expandedRecent, setExpandedRecent] = useState(new Set())
 
   const load = useCallback(async () => {
     if (!runnerId) return
     try {
       const all = await getSurveysForRunner(runnerId)
-      const open = all.filter(s => s.status === 'open')
-      const done = all.filter(s => s.status === 'picked' || s.status === 'done')
+      const open = all.filter(s => s.status === 'open' || s.status === 'picked')
+      const done = all.filter(s => s.status === 'done')
       setOpenSurveys(open)
       setDoneSurveys(done)
-      // Keep existing checked state; only add keys for new surveys
       setChecked(prev => {
         const next = { ...prev }
-        open.forEach(s => { if (!next[s.id]) next[s.id] = new Set() })
+        open.forEach(s => {
+          if (!next[s.id]) {
+            // Pre-populate 'picked' surveys so a hard-refresh restores checkmarks
+            if (s.status === 'picked') {
+              const needed = (s.survey_items ?? []).filter(si => si.qty_needed > 0)
+              next[s.id] = new Set(needed.map(si => si.item_id))
+            } else {
+              next[s.id] = new Set()
+            }
+          }
+        })
         return next
       })
       setError(null)
@@ -58,16 +69,30 @@ export default function PickList() {
     }
   }
 
+  async function handleClose() {
+    const ids = openSurveys.map(s => s.id)
+    if (!ids.length) return
+    setClosing(true)
+    try {
+      await closePickList(ids)
+      showToast('Pick list closed!')
+      await load()
+    } catch (e) {
+      showToast('Error: ' + e.message)
+    } finally {
+      setClosing(false)
+    }
+  }
+
   function handleCheck(surveyId, itemId, value) {
     setChecked(prev => {
       const set = new Set(prev[surveyId] ?? [])
       value ? set.add(itemId) : set.delete(itemId)
       const next = { ...prev, [surveyId]: set }
 
-      // Auto-complete if all items in this survey are now checked
       const survey = openSurveys.find(s => s.id === surveyId)
-      const neededItems = (survey?.survey_items ?? []).filter(si => si.qty_needed > 0)
-      if (neededItems.length > 0 && set.size >= neededItems.length) {
+      const needed = (survey?.survey_items ?? []).filter(si => si.qty_needed > 0)
+      if (needed.length > 0 && set.size >= needed.length) {
         markPicked(surveyId)
       }
 
@@ -77,39 +102,64 @@ export default function PickList() {
 
   function handleMarkAll(surveyId) {
     const survey = openSurveys.find(s => s.id === surveyId)
-    const neededItems = (survey?.survey_items ?? []).filter(si => si.qty_needed > 0)
-    setChecked(prev => ({
-      ...prev,
-      [surveyId]: new Set(neededItems.map(si => si.item_id)),
-    }))
+    const needed = (survey?.survey_items ?? []).filter(si => si.qty_needed > 0)
+    setChecked(prev => ({ ...prev, [surveyId]: new Set(needed.map(si => si.item_id)) }))
     markPicked(surveyId)
   }
 
-  // ── Derived data ────────────────────────────────────────────────────────
+  // ── Derived data ─────────────────────────────────────────────────────────
 
-  // Surveys that have at least one needed item
-  const surveysWithItems = openSurveys.filter(
-    s => (s.survey_items ?? []).some(si => si.qty_needed > 0)
-  )
-  // Surveys with no needed items (runner surveyed but stand was stocked)
-  const emptyOpenSurveys = openSurveys.filter(
-    s => !(s.survey_items ?? []).some(si => si.qty_needed > 0)
+  const activeSurveys  = openSurveys.filter(s => s.status === 'open')
+  const pickedSurveys  = openSurveys.filter(s => s.status === 'picked')
+
+  const surveysWithItems  = activeSurveys.filter(s => (s.survey_items ?? []).some(si => si.qty_needed > 0))
+  const stockedSurveys    = activeSurveys.filter(s => !(s.survey_items ?? []).some(si => si.qty_needed > 0))
+
+  // Collated items: one entry per item type, with a sub-list of stands
+  const itemMap = new Map()
+  for (const survey of openSurveys) {
+    for (const si of (survey.survey_items ?? []).filter(si => si.qty_needed > 0)) {
+      if (!itemMap.has(si.item_id)) {
+        itemMap.set(si.item_id, {
+          id: si.item_id,
+          name: si.items?.name ?? si.item_id,
+          category: si.items?.category ?? '',
+          unit: si.items?.unit ?? '',
+          totalQty: 0,
+          stands: [],
+        })
+      }
+      const entry = itemMap.get(si.item_id)
+      entry.totalQty += si.qty_needed
+      entry.stands.push({
+        surveyId: survey.id,
+        standName: survey.stands?.name ?? '?',
+        standNumber: survey.stands?.number ?? null,
+        qty: si.qty_needed,
+        itemId: si.item_id,
+      })
+    }
+  }
+  const collatedItems = Array.from(itemMap.values()).sort((a, b) =>
+    a.category.localeCompare(b.category) || a.name.localeCompare(b.name)
   )
 
-  // All items across all surveys (for flat view)
-  const allFlatItems = surveysWithItems.flatMap(survey =>
-    (survey.survey_items ?? [])
-      .filter(si => si.qty_needed > 0)
-      .map(si => ({ ...si, surveyId: survey.id, standName: survey.stands?.name ?? '?', standNumber: survey.stands?.number }))
-  ).sort((a, b) =>
-    (a.items?.category ?? '').localeCompare(b.items?.category ?? '') ||
-    (a.items?.name ?? '').localeCompare(b.items?.name ?? '')
-  )
-
-  const totalNeeded = allFlatItems.length
+  // Progress: total stand-item deliveries checked vs needed
+  const totalNeeded  = collatedItems.reduce((sum, item) => sum + item.stands.length, 0)
   const totalChecked = Object.values(checked).reduce((sum, set) => sum + set.size, 0)
 
-  // ── Loading / error ─────────────────────────────────────────────────────
+  // Recent pick lists: done surveys grouped by date
+  const recentByDate = {}
+  for (const survey of doneSurveys) {
+    const label = new Date(survey.created_at).toLocaleDateString('en-US', {
+      weekday: 'short', month: 'short', day: 'numeric',
+    })
+    if (!recentByDate[label]) recentByDate[label] = []
+    recentByDate[label].push(survey)
+  }
+  const recentDates = Object.keys(recentByDate)
+
+  // ── Loading ──────────────────────────────────────────────────────────────
 
   if (loading) {
     return (
@@ -120,9 +170,9 @@ export default function PickList() {
     )
   }
 
-  // ── Empty state ─────────────────────────────────────────────────────────
+  // ── Empty (no active list, no history) ───────────────────────────────────
 
-  if (surveysWithItems.length === 0 && emptyOpenSurveys.length === 0) {
+  if (openSurveys.length === 0 && recentDates.length === 0) {
     return (
       <div className="flex flex-col min-h-full">
         <PickListHeader runnerName={runnerName} navigate={navigate} />
@@ -141,58 +191,58 @@ export default function PickList() {
     )
   }
 
-  // ── Main pick list ──────────────────────────────────────────────────────
+  // ── Main ─────────────────────────────────────────────────────────────────
 
   return (
     <div className="flex flex-col min-h-full">
       <Toast message={toast} />
       <PickListHeader runnerName={runnerName} navigate={navigate} />
 
-      {/* Progress + view toggle */}
-      <div className="bg-white border-b border-slate-200 px-4 py-2 flex items-center justify-between shrink-0">
-        <span className="text-sm font-semibold text-slate-600">
-          {totalChecked} / {totalNeeded} loaded
-        </span>
-        <div className="flex rounded-lg border border-slate-200 overflow-hidden text-xs font-semibold">
-          <button
-            onClick={() => setViewMode('grouped')}
-            className={`px-3 py-1.5 ${viewMode === 'grouped' ? 'bg-emerald-600 text-white' : 'text-slate-500'}`}
-          >
-            By Stand
-          </button>
-          <button
-            onClick={() => setViewMode('flat')}
-            className={`px-3 py-1.5 ${viewMode === 'flat' ? 'bg-emerald-600 text-white' : 'text-slate-500'}`}
-          >
-            All Items
-          </button>
+      {/* Progress bar + view toggle (only when active list exists) */}
+      {openSurveys.length > 0 && (
+        <div className="bg-white border-b border-slate-200 px-4 py-2 flex items-center justify-between shrink-0">
+          <span className="text-sm font-semibold text-slate-600">
+            {totalChecked} / {totalNeeded} loaded
+          </span>
+          <div className="flex rounded-lg border border-slate-200 overflow-hidden text-xs font-semibold">
+            <button
+              onClick={() => setViewMode('grouped')}
+              className={`px-3 py-1.5 ${viewMode === 'grouped' ? 'bg-emerald-600 text-white' : 'text-slate-500'}`}
+            >
+              By Stand
+            </button>
+            <button
+              onClick={() => setViewMode('flat')}
+              className={`px-3 py-1.5 ${viewMode === 'flat' ? 'bg-emerald-600 text-white' : 'text-slate-500'}`}
+            >
+              All Items
+            </button>
+          </div>
         </div>
-      </div>
-
-      {error && (
-        <div className="px-4 py-2 bg-red-50 text-red-600 text-sm shrink-0">{error}</div>
       )}
 
-      <div className="flex-1 overflow-y-auto bg-slate-50 pb-6">
+      {error && <div className="px-4 py-2 bg-red-50 text-red-600 text-sm shrink-0">{error}</div>}
 
-        {/* ── GROUPED VIEW ─────────────────────────────────────────── */}
-        {viewMode === 'grouped' && (
+      {/* Scrollable content */}
+      <div className="flex-1 overflow-y-auto bg-slate-50 pb-4">
+
+        {/* ── BY STAND VIEW ──────────────────────────────────────────── */}
+        {viewMode === 'grouped' && openSurveys.length > 0 && (
           <>
             {surveysWithItems.map(survey => {
-              const neededItems = (survey.survey_items ?? []).filter(si => si.qty_needed > 0)
-              const standLabel = `${survey.stands?.number ? `#${survey.stands.number} · ` : ''}${survey.stands?.name ?? '?'}`
+              const needed       = (survey.survey_items ?? []).filter(si => si.qty_needed > 0)
+              const standLabel   = standName(survey)
               const surveyChecked = checked[survey.id] ?? new Set()
-              const allDone = surveyChecked.size >= neededItems.length
-              const isMarking = marking.has(survey.id)
+              const allDone      = surveyChecked.size >= needed.length
+              const isMarking    = marking.has(survey.id)
 
               return (
                 <div key={survey.id} className="mx-4 mt-4 bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
-                  {/* Stand header */}
                   <div className="px-4 py-3 flex items-center justify-between border-b border-slate-100">
                     <div>
                       <div className="font-bold text-slate-800">{standLabel}</div>
                       <div className="text-xs text-slate-400 mt-0.5">
-                        {surveyChecked.size} / {neededItems.length} items loaded
+                        {surveyChecked.size} / {needed.length} items loaded
                       </div>
                     </div>
                     <button
@@ -204,8 +254,7 @@ export default function PickList() {
                     </button>
                   </div>
 
-                  {/* Item rows */}
-                  {neededItems
+                  {needed
                     .sort((a, b) =>
                       (a.items?.category ?? '').localeCompare(b.items?.category ?? '') ||
                       (a.items?.name ?? '').localeCompare(b.items?.name ?? '')
@@ -239,26 +288,44 @@ export default function PickList() {
               )
             })}
 
-            {/* Stocked stands (empty surveys) */}
-            {emptyOpenSurveys.length > 0 && (
+            {/* Fully stocked stands */}
+            {stockedSurveys.length > 0 && (
+              <div className="mx-4 mt-4">
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Fully Stocked</p>
+                <div className="bg-white rounded-2xl border border-slate-200 divide-y divide-slate-100">
+                  {stockedSurveys.map(survey => (
+                    <div key={survey.id} className="flex items-center px-4 py-3 gap-3">
+                      <span className="text-emerald-500 text-lg">✓</span>
+                      <span className="font-medium text-slate-700">{standName(survey)}</span>
+                      <button
+                        onClick={() => markPicked(survey.id)}
+                        disabled={marking.has(survey.id)}
+                        className="ml-auto text-xs text-slate-400 font-medium disabled:opacity-50"
+                      >
+                        {marking.has(survey.id) ? '…' : 'Done'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Delivered stands (status = picked) */}
+            {pickedSurveys.length > 0 && (
               <div className="mx-4 mt-4">
                 <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">
-                  Fully Stocked
+                  Delivered ({pickedSurveys.length})
                 </p>
-                <div className="bg-white rounded-2xl border border-slate-200 divide-y divide-slate-100">
-                  {emptyOpenSurveys.map(survey => {
-                    const standLabel = `${survey.stands?.number ? `#${survey.stands.number} · ` : ''}${survey.stands?.name ?? '?'}`
+                <div className="bg-white rounded-2xl border border-slate-200 divide-y divide-slate-100 opacity-60">
+                  {pickedSurveys.map(survey => {
+                    const itemCount = (survey.survey_items ?? []).filter(si => si.qty_needed > 0).length
                     return (
                       <div key={survey.id} className="flex items-center px-4 py-3 gap-3">
                         <span className="text-emerald-500 text-lg">✓</span>
-                        <span className="font-medium text-slate-700">{standLabel}</span>
-                        <button
-                          onClick={() => markPicked(survey.id)}
-                          disabled={marking.has(survey.id)}
-                          className="ml-auto text-xs text-slate-400 font-medium disabled:opacity-50"
-                        >
-                          {marking.has(survey.id) ? '…' : 'Done'}
-                        </button>
+                        <div className="flex-1">
+                          <div className="font-medium text-slate-700">{standName(survey)}</div>
+                          <div className="text-xs text-slate-400">{itemCount} item{itemCount !== 1 ? 's' : ''} loaded</div>
+                        </div>
                       </div>
                     )
                   })}
@@ -268,74 +335,216 @@ export default function PickList() {
           </>
         )}
 
-        {/* ── FLAT VIEW ────────────────────────────────────────────── */}
-        {viewMode === 'flat' && (
-          <div className="mx-4 mt-4 bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
-            {allFlatItems.length === 0 ? (
-              <div className="p-6 text-center text-slate-400 text-sm">No items to load.</div>
+        {/* ── ALL ITEMS (COLLATED) VIEW ───────────────────────────────── */}
+        {viewMode === 'flat' && openSurveys.length > 0 && (
+          <>
+            {collatedItems.length === 0 ? (
+              <div className="mx-4 mt-4 bg-white rounded-2xl border border-slate-200 p-6 text-center text-slate-400 text-sm">
+                No items to load.
+              </div>
             ) : (
-              allFlatItems.map((si, idx) => {
-                const isChecked = (checked[si.surveyId] ?? new Set()).has(si.item_id)
-                const standLabel = `${si.standNumber ? `#${si.standNumber} · ` : ''}${si.standName}`
+              collatedItems.map(item => {
+                const deliveredCount = item.stands.filter(
+                  s => (checked[s.surveyId] ?? new Set()).has(s.itemId)
+                ).length
+                const allDelivered = deliveredCount === item.stands.length
+
                 return (
-                  <label
-                    key={`${si.surveyId}-${si.item_id}`}
-                    className={`flex items-center px-4 py-3.5 border-b border-slate-100 last:border-0 gap-4 cursor-pointer select-none active:bg-slate-50 ${isChecked ? 'opacity-50' : ''}`}
+                  <div
+                    key={item.id}
+                    className={`mx-4 mt-4 bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm ${allDelivered ? 'opacity-50' : ''}`}
                   >
-                    <input
-                      type="checkbox"
-                      checked={isChecked}
-                      onChange={e => handleCheck(si.surveyId, si.item_id, e.target.checked)}
-                      className="w-5 h-5 rounded accent-emerald-600 shrink-0"
-                    />
-                    <div className="flex-1 min-w-0">
-                      <div className={`font-medium text-slate-800 ${isChecked ? 'line-through' : ''}`}>
-                        {si.items?.name ?? si.item_id}
+                    {/* Item header — shows total qty and delivery progress */}
+                    <div className="px-4 py-3 flex items-center gap-3 bg-slate-50 border-b border-slate-100">
+                      <div className="flex-1 min-w-0">
+                        <div className={`font-bold text-slate-800 ${allDelivered ? 'line-through' : ''}`}>
+                          {item.name}
+                          <span className="text-slate-400 text-sm font-normal ml-1.5">· {item.unit}</span>
+                        </div>
+                        <div className="text-xs text-slate-400 mt-0.5">
+                          {deliveredCount} of {item.stands.length} stand{item.stands.length !== 1 ? 's' : ''} delivered
+                        </div>
                       </div>
-                      <div className="text-xs text-slate-400 mt-0.5">{standLabel}</div>
+                      <span className="shrink-0 text-2xl font-bold text-emerald-700 tabular-nums">
+                        ×{item.totalQty}
+                      </span>
                     </div>
-                    <span className="shrink-0 text-lg font-bold text-slate-700 tabular-nums">
-                      ×{si.qty_needed}
-                    </span>
-                  </label>
+
+                    {/* Per-stand rows with checkboxes */}
+                    {item.stands
+                      .sort((a, b) =>
+                        (a.standNumber?.toString() ?? a.standName)
+                          .localeCompare(b.standNumber?.toString() ?? b.standName)
+                      )
+                      .map(stand => {
+                        const isChecked = (checked[stand.surveyId] ?? new Set()).has(stand.itemId)
+                        const label = stand.standNumber ? `#${stand.standNumber} · ${stand.standName}` : stand.standName
+                        return (
+                          <label
+                            key={`${stand.surveyId}-${stand.itemId}`}
+                            className={`flex items-center px-4 py-3 border-b border-slate-100 last:border-0 gap-3 cursor-pointer select-none active:bg-slate-50 ${isChecked ? 'opacity-40' : ''}`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={e => handleCheck(stand.surveyId, stand.itemId, e.target.checked)}
+                              className="w-5 h-5 rounded accent-emerald-600 shrink-0"
+                            />
+                            <span className={`flex-1 text-sm font-medium text-slate-700 ${isChecked ? 'line-through' : ''}`}>
+                              {label}
+                            </span>
+                            <span className="shrink-0 text-base font-bold text-slate-600 tabular-nums">
+                              ×{stand.qty}
+                            </span>
+                          </label>
+                        )
+                      })}
+                  </div>
                 )
               })
             )}
+          </>
+        )}
+
+        {/* ── RECENT PICK LISTS ───────────────────────────────────────── */}
+        {recentDates.length > 0 && (
+          <div className="mx-4 mt-6 mb-2">
+            <p className="text-xs font-bold text-slate-400 uppercase tracking-wide mb-3">
+              Recent Pick Lists
+            </p>
+            <div className="flex flex-col gap-3">
+              {recentDates.map(date => {
+                const surveys    = recentByDate[date]
+                const isExpanded = expandedRecent.has(date)
+
+                // Build the collated read-only view for this historical list
+                const histMap = new Map()
+                for (const survey of surveys) {
+                  for (const si of (survey.survey_items ?? []).filter(si => si.qty_needed > 0)) {
+                    if (!histMap.has(si.item_id)) {
+                      histMap.set(si.item_id, {
+                        id: si.item_id,
+                        name: si.items?.name ?? si.item_id,
+                        category: si.items?.category ?? '',
+                        unit: si.items?.unit ?? '',
+                        totalQty: 0,
+                        stands: [],
+                      })
+                    }
+                    const entry = histMap.get(si.item_id)
+                    entry.totalQty += si.qty_needed
+                    entry.stands.push({
+                      standName: survey.stands?.name ?? '?',
+                      standNumber: survey.stands?.number ?? null,
+                      qty: si.qty_needed,
+                    })
+                  }
+                }
+                const histItems = Array.from(histMap.values()).sort((a, b) =>
+                  a.category.localeCompare(b.category) || a.name.localeCompare(b.name)
+                )
+                const totalItemsQty = histItems.reduce((sum, i) => sum + i.totalQty, 0)
+
+                return (
+                  <div key={date} className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
+                    {/* Accordion header */}
+                    <button
+                      onClick={() => setExpandedRecent(prev => {
+                        const next = new Set(prev)
+                        isExpanded ? next.delete(date) : next.add(date)
+                        return next
+                      })}
+                      className="w-full px-4 py-3.5 flex items-center justify-between active:bg-slate-50"
+                    >
+                      <div className="text-left">
+                        <div className="font-semibold text-slate-800 text-sm">{date}</div>
+                        <div className="text-xs text-slate-400 mt-0.5">
+                          {surveys.length} stand{surveys.length !== 1 ? 's' : ''} · {totalItemsQty} items total
+                        </div>
+                      </div>
+                      <span className="text-slate-400 text-sm ml-3">{isExpanded ? '▲' : '▼'}</span>
+                    </button>
+
+                    {/* Collated detail (read-only) */}
+                    {isExpanded && (
+                      <div className="border-t border-slate-100">
+                        {histItems.length === 0 ? (
+                          <p className="px-4 py-3 text-sm text-slate-400">All stands were fully stocked.</p>
+                        ) : (
+                          histItems.map(item => (
+                            <div key={item.id} className="border-b border-slate-100 last:border-0">
+                              {/* Item row */}
+                              <div className="px-4 py-2.5 flex items-center justify-between bg-slate-50 border-b border-slate-50">
+                                <div>
+                                  <span className="font-semibold text-slate-700 text-sm">{item.name}</span>
+                                  <span className="text-slate-400 text-xs ml-1.5">· {item.unit}</span>
+                                </div>
+                                <span className="font-bold text-slate-600 tabular-nums text-sm">×{item.totalQty}</span>
+                              </div>
+                              {/* Stand breakdown */}
+                              {item.stands
+                                .sort((a, b) =>
+                                  (a.standNumber?.toString() ?? a.standName)
+                                    .localeCompare(b.standNumber?.toString() ?? b.standName)
+                                )
+                                .map((stand, i) => {
+                                  const label = stand.standNumber
+                                    ? `#${stand.standNumber} · ${stand.standName}`
+                                    : stand.standName
+                                  return (
+                                    <div key={i} className="px-6 py-2 flex items-center justify-between">
+                                      <span className="text-sm text-slate-600">{label}</span>
+                                      <span className="text-sm font-medium text-slate-500 tabular-nums">×{stand.qty}</span>
+                                    </div>
+                                  )
+                                })}
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
           </div>
         )}
 
-        {/* ── Done / Picked surveys ─────────────────────────────────── */}
-        {doneSurveys.length > 0 && (
-          <div className="mx-4 mt-6">
+        {/* No active list but has history */}
+        {openSurveys.length === 0 && recentDates.length > 0 && (
+          <div className="mx-4 mt-4 text-center">
+            <p className="text-slate-400 text-sm mb-3">No active pick list.</p>
             <button
-              onClick={() => setShowDone(s => !s)}
-              className="w-full flex items-center justify-between text-xs font-bold text-slate-400 uppercase tracking-wide py-1 mb-2"
+              onClick={() => navigate('/runner')}
+              className="px-6 py-3 bg-emerald-600 text-white rounded-xl font-semibold text-sm"
             >
-              <span>Loaded ({doneSurveys.length} stand{doneSurveys.length !== 1 ? 's' : ''})</span>
-              <span>{showDone ? '▲' : '▼'}</span>
+              Go Survey Stands
             </button>
-            {showDone && (
-              <div className="bg-white rounded-2xl border border-slate-200 divide-y divide-slate-100 opacity-60">
-                {doneSurveys.map(survey => {
-                  const standLabel = `${survey.stands?.number ? `#${survey.stands.number} · ` : ''}${survey.stands?.name ?? '?'}`
-                  const itemCount = (survey.survey_items ?? []).filter(si => si.qty_needed > 0).length
-                  return (
-                    <div key={survey.id} className="flex items-center px-4 py-3 gap-3">
-                      <span className="text-emerald-500 text-lg">✓</span>
-                      <div className="flex-1">
-                        <div className="font-medium text-slate-700">{standLabel}</div>
-                        <div className="text-xs text-slate-400">{itemCount} item{itemCount !== 1 ? 's' : ''} loaded</div>
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-            )}
           </div>
         )}
       </div>
+
+      {/* Close Pick List — sticky footer, visible while active list exists */}
+      {openSurveys.length > 0 && (
+        <div className="shrink-0 bg-white border-t border-slate-200 px-4 pt-3 pb-safe">
+          <button
+            onClick={handleClose}
+            disabled={closing}
+            className="w-full py-4 border-2 border-slate-300 text-slate-600 rounded-2xl font-semibold text-base disabled:opacity-50 active:bg-slate-50"
+          >
+            {closing ? 'Closing…' : 'Close Pick List'}
+          </button>
+        </div>
+      )}
     </div>
   )
+}
+
+// Returns "Stand Name" or "#N · Stand Name"
+function standName(survey) {
+  return survey.stands?.number
+    ? `#${survey.stands.number} · ${survey.stands.name}`
+    : (survey.stands?.name ?? '?')
 }
 
 function PickListHeader({ runnerName, navigate }) {
