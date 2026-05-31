@@ -250,7 +250,7 @@ export async function getRecentDoneRequests(limit = 20) {
 export async function getRequestsForStand(standId, limit = 20) {
   const { data, error } = await supabase
     .from('requests')
-    .select('*, request_items(*, items(name, unit)), runners(name)')
+    .select('*, stands(name, number), request_items(*, items(name, unit)), runners(name)')
     .eq('stand_id', standId)
     .order('created_at', { ascending: false })
     .limit(limit)

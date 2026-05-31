@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useSession } from '../hooks/useSession'
+import { useOpenRequestCount } from '../hooks/useOpenRequestCount'
 import { getRunners } from '../lib/db'
 import QueueView from '../components/QueueView'
 import StandPicker from '../components/StandPicker'
@@ -18,12 +19,23 @@ export default function RunnerHome() {
   const [loadingRunners, setLoadingRunners] = useState(true)
   const [runnersError, setRunnersError] = useState(null)
 
+  // Live open-request count for the banner + browser notifications
+  const openCount = useOpenRequestCount()
+
   useEffect(() => {
     if (!runnerId) {
       getRunners()
         .then(setRunners)
         .catch(e => setRunnersError(e.message))
         .finally(() => setLoadingRunners(false))
+    }
+  }, [runnerId])
+
+  // Ask for notification permission once the runner has identified themselves
+  useEffect(() => {
+    if (!runnerId) return
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission()
     }
   }, [runnerId])
 
@@ -89,6 +101,19 @@ export default function RunnerHome() {
         </button>
       </div>
 
+      {/* Open-request banner — only shown on Survey tab so it doesn't duplicate the queue */}
+      {openCount > 0 && tab === 'survey' && (
+        <button
+          onClick={() => setTab('queue')}
+          className="w-full bg-amber-500 active:bg-amber-600 text-white px-4 py-2.5 flex items-center justify-between shrink-0"
+        >
+          <span className="text-sm font-semibold">
+            {openCount} open request{openCount !== 1 ? 's' : ''} waiting
+          </span>
+          <span className="text-sm font-bold">View Queue →</span>
+        </button>
+      )}
+
       <div className="flex border-b border-slate-200 bg-white shrink-0">
         <button
           onClick={() => setTab('survey')}
@@ -104,7 +129,7 @@ export default function RunnerHome() {
             tab === 'queue' ? 'text-emerald-600 border-b-2 border-emerald-600' : 'text-slate-500'
           }`}
         >
-          Queue
+          Queue{openCount > 0 ? ` (${openCount})` : ''}
         </button>
       </div>
 
