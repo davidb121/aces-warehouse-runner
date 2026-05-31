@@ -17,7 +17,7 @@ export default function PickList() {
   const [checked, setChecked] = useState({})        // { [surveyId]: Set<itemId> }
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [viewMode, setViewMode] = useState('grouped')
+  const [viewMode, setViewMode] = useState('flat')
   const [marking, setMarking] = useState(new Set()) // surveyIds being marked as picked
   const [closing, setClosing] = useState(false)
   const [expandedRecent, setExpandedRecent] = useState(new Set())

@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import { useSession } from '../hooks/useSession'
-import { getStand, getStandCatalog, createSurvey } from '../lib/db'
+import { getStand, getStandCatalog, createSurvey, getActiveSurveyForStand, updateSurvey } from '../lib/db'
 
 export default function SurveyEntry() {
   const { standId } = useParams()
@@ -15,6 +15,7 @@ export default function SurveyEntry() {
   )
   const [items, setItems] = useState([])
   const [qtys, setQtys] = useState({})
+  const [existingSurvey, setExistingSurvey] = useState(null)
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)
@@ -28,17 +29,26 @@ export default function SurveyEntry() {
     const fetches = [
       getStandCatalog(standId),
       stand ? Promise.resolve(stand) : getStand(standId),
+      getActiveSurveyForStand(standId, runnerId),
     ]
 
     Promise.all(fetches)
-      .then(([catalog, foundStand]) => {
+      .then(([catalog, foundStand, existing]) => {
         const sorted = [...catalog].sort(
           (a, b) => (a.category ?? '').localeCompare(b.category ?? '') || a.name.localeCompare(b.name)
         )
         setStand(foundStand)
         setItems(sorted)
+        setExistingSurvey(existing)
+
+        // Start at 0 for each item, then overlay any quantities from an existing survey
         const init = {}
         sorted.forEach(i => { init[i.id] = 0 })
+        if (existing) {
+          existing.survey_items.forEach(si => {
+            if (si.item_id in init) init[si.item_id] = si.qty_needed
+          })
+        }
         setQtys(init)
       })
       .catch(e => setError(e.message))
@@ -56,7 +66,11 @@ export default function SurveyEntry() {
     setError(null)
     try {
       const surveyItems = items.map(i => ({ item_id: i.id, qty_needed: qtys[i.id] ?? 0 }))
-      await createSurvey(standId, runnerId, surveyItems)
+      if (existingSurvey) {
+        await updateSurvey(existingSurvey.id, surveyItems)
+      } else {
+        await createSurvey(standId, runnerId, surveyItems)
+      }
       navigate('/runner/picklist')
     } catch (e) {
       setError(e.message)
@@ -89,6 +103,12 @@ export default function SurveyEntry() {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto bg-slate-50 pb-28">
+        {existingSurvey && (
+          <div className="px-4 py-2.5 bg-amber-50 border-b border-amber-100 text-amber-800 text-sm">
+            Editing existing survey — adjust quantities and save.
+          </div>
+        )}
+
         {error && (
           <div className="px-4 py-2 bg-red-50 text-red-600 text-sm">{error}</div>
         )}
@@ -167,9 +187,13 @@ export default function SurveyEntry() {
           >
             {submitting
               ? 'Saving…'
-              : totalItems > 0
-                ? `Save Survey (${totalItems} item${totalItems !== 1 ? 's' : ''})`
-                : 'Save Survey (stand is stocked)'}
+              : existingSurvey
+                ? totalItems > 0
+                  ? `Update Survey (${totalItems} item${totalItems !== 1 ? 's' : ''})`
+                  : 'Update Survey (stand is stocked)'
+                : totalItems > 0
+                  ? `Save Survey (${totalItems} item${totalItems !== 1 ? 's' : ''})`
+                  : 'Save Survey (stand is stocked)'}
           </button>
         </div>
       )}

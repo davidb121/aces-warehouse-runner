@@ -195,6 +195,38 @@ export async function getSurveysForRunner(runnerId) {
   return data
 }
 
+/** Returns the runner's active (status='open') survey for a stand, or null. */
+export async function getActiveSurveyForStand(standId, runnerId) {
+  const { data, error } = await supabase
+    .from('surveys')
+    .select('*, survey_items(item_id, qty_needed)')
+    .eq('stand_id', standId)
+    .eq('runner_id', runnerId)
+    .eq('status', 'open')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  if (error) throw error
+  return data
+}
+
+/** Replaces all items in an existing survey (for the edit/reopen flow). */
+export async function updateSurvey(surveyId, items) {
+  const { error: delError } = await supabase
+    .from('survey_items')
+    .delete()
+    .eq('survey_id', surveyId)
+  if (delError) throw delError
+
+  const rows = items
+    .filter(i => i.qty_needed > 0)
+    .map(i => ({ survey_id: surveyId, item_id: i.item_id, qty_needed: i.qty_needed }))
+  if (rows.length > 0) {
+    const { error: insError } = await supabase.from('survey_items').insert(rows)
+    if (insError) throw insError
+  }
+}
+
 export async function createSurvey(standId, runnerId, items) {
   const { data: survey, error: surveyError } = await supabase
     .from('surveys')
